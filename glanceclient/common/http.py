@@ -311,16 +311,23 @@ class SessionClient(adapter.Adapter):
         headers['Content-Type'] = content_type
         kwargs['data'] = data
         kwargs['raise_exc'] = False
+        kwargs['log'] = False
         kwargs['stream'] = content_type == 'application/octet-stream'
 
+        conn_url = self.get_endpoint(auth=kwargs.get('auth'))
+        conn_url = "%s/%s" % (conn_url.rstrip('/'), url.lstrip('/'))
+
+        self._log_curl_request(method, conn_url, headers, data, kwargs)
+
         try:
-            resp = super(SessionClient, self).request(url, method, **kwargs)
+            resp = super(SessionClient, self).request(conn_url,
+                                                      method,
+                                                      **kwargs)
         except ksc_exc.RequestTimeout as e:
             message = ("Error communicating with %(endpoint)s %(e)s" %
                        dict(url=conn_url, e=e))
             raise exc.InvalidEndpoint(message=message)
         except ksc_exc.ConnectionRefused as e:
-            conn_url = self.get_endpoint(auth=kwargs.get('auth'))
             message = ("Error finding address for %(url)s: %(e)s" %
                        dict(url=conn_url, e=e))
             raise exc.CommunicationError(message=message)
@@ -337,8 +344,10 @@ class SessionClient(adapter.Adapter):
         if content_type == 'application/octet-stream':
             # Do not read all response in memory when downloading an image.
             body_iter = _close_after_stream(resp, CHUNKSIZE)
+            self._log_http_response(resp)
         else:
             content = resp.content
+            self._log_http_response(resp, content)
             if content_type and content_type.startswith('application/json'):
                 # Let's use requests json method, it should take care of
                 # response encoding
@@ -350,6 +359,44 @@ class SessionClient(adapter.Adapter):
                 except ValueError:
                     body_iter = None
         return resp, body_iter
+
+    def _log_curl_request(self, method, url, headers, data, kwargs):
+        curl = ['curl -g -i -X %s' % method]
+
+        for (key, value) in six.iteritems(headers):
+            header = '-H \'%s: %s\'' % safe_header(key, value)
+            curl.append(header)
+
+        if not self.session.verify:
+            curl.append('-k')
+        else:
+            if isinstance(self.session.verify, six.string_types):
+                curl.append(' --cacert %s' % self.session.verify)
+
+        if self.session.cert:
+            curl.append(' --cert %s --key %s' % self.session.cert)
+
+        if data and isinstance(data, six.string_types):
+            curl.append('-d \'%s\'' % data)
+
+        curl.append(url)
+
+        msg = ' '.join([encodeutils.safe_decode(item, errors='ignore')
+                        for item in curl])
+        LOG.debug(msg)
+
+    @staticmethod
+    def _log_http_response(resp, body=None):
+        status = (resp.raw.version / 10.0, resp.status_code, resp.reason)
+        dump = ['\nHTTP/%.1f %s %s' % status]
+        headers = resp.headers.items()
+        dump.extend(['%s: %s' % safe_header(k, v) for k, v in headers])
+        dump.append('')
+        if body:
+            body = encodeutils.safe_decode(body)
+            dump.extend([body, ''])
+        LOG.debug('\n'.join([encodeutils.safe_decode(x, errors='ignore')
+                             for x in dump]))
 
 
 def get_http_client(endpoint=None, session=None, **kwargs):
